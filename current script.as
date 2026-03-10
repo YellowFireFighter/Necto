@@ -111,21 +111,23 @@ bool read_pos(uint64 obj, float &out x, float &out y, float &out z)
 
 // Send a key-down or key-up only when the state actually changes,
 // to avoid flooding the input queue with redundant events.
-void apply_key(uint vk, bool &inout cur, bool want)
+// Returns the updated key state (assign back to the tracking variable).
+bool apply_key(uint vk, bool cur, bool want)
 {
-    if (want && !cur)      { win_key_down(vk); cur = true;  }
-    else if (!want && cur) { win_key_up(vk);   cur = false; }
+    if (want && !cur)      win_key_down(vk);
+    else if (!want && cur) win_key_up(vk);
+    return want;
 }
 
 void release_all_keys()
 {
-    apply_key(VK_THROTTLE,  g_key_throttle,  false);
-    apply_key(VK_REVERSE,   g_key_reverse,   false);
-    apply_key(VK_LEFT,      g_key_left,      false);
-    apply_key(VK_RIGHT,     g_key_right,     false);
-    apply_key(VK_BOOST,     g_key_boost,     false);
-    apply_key(VK_JUMP,      g_key_jump,      false);
-    apply_key(VK_HANDBRAKE, g_key_handbrake, false);
+    g_key_throttle  = apply_key(VK_THROTTLE,  g_key_throttle,  false);
+    g_key_reverse   = apply_key(VK_REVERSE,   g_key_reverse,   false);
+    g_key_left      = apply_key(VK_LEFT,      g_key_left,      false);
+    g_key_right     = apply_key(VK_RIGHT,     g_key_right,     false);
+    g_key_boost     = apply_key(VK_BOOST,     g_key_boost,     false);
+    g_key_jump      = apply_key(VK_JUMP,      g_key_jump,      false);
+    g_key_handbrake = apply_key(VK_HANDBRAKE, g_key_handbrake, false);
 }
 
 // ── Scanners ──────────────────────────────────────────────────
@@ -263,13 +265,13 @@ void run_bot(float cx, float cy, float bx, float by)
     }
 
     // ── Apply keys via Win API ──────────────────────────────
-    apply_key(VK_THROTTLE,  g_key_throttle,  want_throttle);
-    apply_key(VK_REVERSE,   g_key_reverse,   want_reverse);
-    apply_key(VK_LEFT,      g_key_left,      want_left);
-    apply_key(VK_RIGHT,     g_key_right,     want_right);
-    apply_key(VK_BOOST,     g_key_boost,     want_boost);
-    apply_key(VK_JUMP,      g_key_jump,      want_jump);
-    apply_key(VK_HANDBRAKE, g_key_handbrake, want_handbrake);
+    g_key_throttle  = apply_key(VK_THROTTLE,  g_key_throttle,  want_throttle);
+    g_key_reverse   = apply_key(VK_REVERSE,   g_key_reverse,   want_reverse);
+    g_key_left      = apply_key(VK_LEFT,      g_key_left,      want_left);
+    g_key_right     = apply_key(VK_RIGHT,     g_key_right,     want_right);
+    g_key_boost     = apply_key(VK_BOOST,     g_key_boost,     want_boost);
+    g_key_jump      = apply_key(VK_JUMP,      g_key_jump,      want_jump);
+    g_key_handbrake = apply_key(VK_HANDBRAKE, g_key_handbrake, want_handbrake);
 }
 
 // ── Render ────────────────────────────────────────────────────
