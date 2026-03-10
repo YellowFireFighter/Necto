@@ -1,5 +1,5 @@
 // ============================================================
-//  RL Position Overlay — v8
+//  RL Position Overlay + Necto Bot — v9
 // ============================================================
 
 const uint64 GNAMES_OFF    = 0x23F0850;
@@ -12,6 +12,27 @@ const uint64 PC_CAR_PTR    = 0x280;
 
 const int    STALE_TICKS   = 120;   // 2s at 60fps
 const int    COOLDOWN      = 30;
+
+// ── Bot key mappings (default Rocket League bindings) ──────
+const uint VK_THROTTLE  = 0x57;   // W
+const uint VK_REVERSE   = 0x53;   // S
+const uint VK_LEFT      = 0x41;   // A
+const uint VK_RIGHT     = 0x44;   // D
+const uint VK_JUMP      = 0x20;   // Space
+const uint VK_BOOST     = 0xA0;   // Left Shift
+const uint VK_HANDBRAKE = 0x58;   // X
+
+// ── Bot tuning ─────────────────────────────────────────────
+const float BOOST_DIST          = 2000.0f;  // boost when farther than this from ball
+const float STEER_THRESH        = 0.18f;    // steering dead-zone (radians)
+const float CLOSE_DIST          = 700.0f;   // aim for goal when within this of ball
+const float APPROACH_BACK       = 400.0f;   // stay this many units behind ball when far
+const float ORANGE_GOAL_Y       = 5120.0f;  // opponent (orange) goal Y
+const float ORANGE_GOAL_X       = 0.0f;     // opponent goal X (centre)
+// Reverse instead of U-turning when target is more than ~153° behind the car
+const float REVERSE_ANGLE       = 0.85f;    // fraction of π
+// Minimum per-tick displacement (UU) required to trust the heading estimate
+const float MIN_SPEED_FOR_HEADING = 2.0f;
 
 proc_t  g_proc;
 uint64  g_base, g_gnames, g_gobjects;
@@ -26,6 +47,22 @@ int     g_ball_cooldown    = 0;
 int     g_pc_cooldown      = 0;
 int     g_ball_still_ticks = 0;
 float   g_ball_last_x = 0, g_ball_last_y = 0, g_ball_last_z = 0;
+
+// ── Bot state ──────────────────────────────────────────────
+bool  g_bot_enabled  = true;
+float g_car_prev_x   = 0.0f;
+float g_car_prev_y   = 0.0f;
+bool  g_has_prev_pos = false;
+float g_car_heading  = 0.0f;   // estimated heading angle (radians)
+
+// ── Tracked key states (avoids duplicate down/up calls) ────
+bool g_key_throttle  = false;
+bool g_key_reverse   = false;
+bool g_key_left      = false;
+bool g_key_right     = false;
+bool g_key_boost     = false;
+bool g_key_jump      = false;
+bool g_key_handbrake = false;
 
 // ── Helpers ───────────────────────────────────────────────────
 
@@ -68,6 +105,27 @@ bool read_pos(uint64 obj, float &out x, float &out y, float &out z)
     y = g_proc.rf32(obj + POS_OFF + 4);
     z = g_proc.rf32(obj + POS_OFF + 8);
     return is_valid_arena_pos(x, y, z);
+}
+
+// ── Bot key helpers ────────────────────────────────────────
+
+// Send a key-down or key-up only when the state actually changes,
+// to avoid flooding the input queue with redundant events.
+void apply_key(uint vk, bool &inout cur, bool want)
+{
+    if (want && !cur)      { win_key_down(vk); cur = true;  }
+    else if (!want && cur) { win_key_up(vk);   cur = false; }
+}
+
+void release_all_keys()
+{
+    apply_key(VK_THROTTLE,  g_key_throttle,  false);
+    apply_key(VK_REVERSE,   g_key_reverse,   false);
+    apply_key(VK_LEFT,      g_key_left,      false);
+    apply_key(VK_RIGHT,     g_key_right,     false);
+    apply_key(VK_BOOST,     g_key_boost,     false);
+    apply_key(VK_JUMP,      g_key_jump,      false);
+    apply_key(VK_HANDBRAKE, g_key_handbrake, false);
 }
 
 // ── Scanners ──────────────────────────────────────────────────
@@ -129,6 +187,89 @@ void find_pc()
         }
     }
     log_console("[Overlay] PlayerController_TA not found");
+}
+
+// ── Necto-style bot ────────────────────────────────────────
+//
+// Reads car and ball positions each tick, estimates the car's heading
+// from the position delta, picks a target (approach position when far,
+// orange-goal when close), then drives toward it using the Win API
+// global keyboard functions (win_key_down / win_key_up).
+//
+// Bot always assumes it is playing for blue (attacking the orange goal
+// at +Y).  Toggle on/off with F8.
+//
+void run_bot(float cx, float cy, float bx, float by)
+{
+    const float PI = 3.14159265f;
+
+    // ── Update heading estimate from position delta ─────────
+    if (g_has_prev_pos)
+    {
+        float hx  = cx - g_car_prev_x;
+        float hy  = cy - g_car_prev_y;
+        float spd = sqrt(hx * hx + hy * hy);
+        if (spd > MIN_SPEED_FOR_HEADING)             // only update while moving
+            g_car_heading = atan2(hx, hy);    // angle from +Y axis: 0 = forward (+Y)
+    }
+    g_car_prev_x   = cx;
+    g_car_prev_y   = cy;
+    g_has_prev_pos = true;
+
+    // ── Choose target position ──────────────────────────────
+    float dist_to_ball = sqrt((bx - cx) * (bx - cx) + (by - cy) * (by - cy));
+
+    float target_x, target_y;
+    if (dist_to_ball < CLOSE_DIST)
+    {
+        // Close to ball → drive through it toward the orange goal
+        target_x = ORANGE_GOAL_X;
+        target_y = ORANGE_GOAL_Y;
+    }
+    else
+    {
+        // Far from ball → approach from directly behind (blue-goal side of ball)
+        target_x = bx;                 // align X with ball
+        target_y = by - APPROACH_BACK; // come from our goal side
+    }
+
+    // ── Desired heading angle (same atan2(x,y) convention as g_car_heading) ─
+    float desired_angle = atan2(target_x - cx, target_y - cy);
+
+    // ── Angle difference, normalised to [-π, π] ────────────
+    float diff = desired_angle - g_car_heading;
+    if (diff >  PI) diff -= 2.0f * PI;
+    if (diff < -PI) diff += 2.0f * PI;
+
+    // ── Derive desired control state ────────────────────────
+    bool want_throttle  = true;
+    bool want_reverse   = false;
+    bool want_left      = diff < -STEER_THRESH;
+    bool want_right     = diff >  STEER_THRESH;
+    bool want_boost     = dist_to_ball > BOOST_DIST;
+    bool want_jump      = false;
+    bool want_handbrake = false;
+
+    // Target is roughly behind us → reverse + flip steering rather
+    // than driving a full U-turn.
+    if (diff > PI * REVERSE_ANGLE || diff < -PI * REVERSE_ANGLE)
+    {
+        want_throttle = false;
+        want_reverse  = true;
+        bool tmp   = want_left;
+        want_left  = want_right;
+        want_right = tmp;
+        want_boost = false;
+    }
+
+    // ── Apply keys via Win API ──────────────────────────────
+    apply_key(VK_THROTTLE,  g_key_throttle,  want_throttle);
+    apply_key(VK_REVERSE,   g_key_reverse,   want_reverse);
+    apply_key(VK_LEFT,      g_key_left,      want_left);
+    apply_key(VK_RIGHT,     g_key_right,     want_right);
+    apply_key(VK_BOOST,     g_key_boost,     want_boost);
+    apply_key(VK_JUMP,      g_key_jump,      want_jump);
+    apply_key(VK_HANDBRAKE, g_key_handbrake, want_handbrake);
 }
 
 // ── Render ────────────────────────────────────────────────────
@@ -249,6 +390,33 @@ void on_tick(int id, int data_index)
 
     draw_panel(PAD_X, PAD_Y + PANEL_H + GAP, PANEL_W, PANEL_H,
                "BALL POSITION", ball_str, 255, 150, 40);
+
+    // ── Bot status panel ───────────────────────────────────
+    string bot_str;
+    if (!g_bot_enabled)
+        bot_str = "DISABLED  (toggle: F8)";
+    else if (!have_car || !have_ball)
+        bot_str = "waiting for positions...";
+    else
+    {
+        string steer  = g_key_left ? "LEFT" : (g_key_right ? "RIGHT" : "STRAIGHT");
+        string action = g_key_throttle ? "FWD" : (g_key_reverse ? "REV" : "IDLE");
+        bot_str = action + "  " + steer + (g_key_boost ? "  BOOST" : "");
+    }
+    draw_panel(PAD_X, PAD_Y + (PANEL_H + GAP) * 2, PANEL_W, PANEL_H,
+               "NECTO BOT", bot_str, 120, 255, 80);
+
+    // ── Toggle bot with F8 ─────────────────────────────────
+    if (key_fired(0x77)) // F8
+    {
+        g_bot_enabled = !g_bot_enabled;
+        if (!g_bot_enabled) release_all_keys();
+        log_console("[Bot] " + (g_bot_enabled ? "enabled" : "disabled"));
+    }
+
+    // ── Run bot ────────────────────────────────────────────
+    if (g_bot_enabled && have_car && have_ball)
+        run_bot(cx, cy, bx, by);
 }
 
 // ── Entry ─────────────────────────────────────────────────────
@@ -278,6 +446,7 @@ int main()
 
 void on_unload()
 {
+    release_all_keys();
     g_proc.deref();
     log_console("[Overlay] Unloaded");
 }
